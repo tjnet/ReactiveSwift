@@ -658,7 +658,7 @@ public final class MutableProperty<Value>: ComposableMutablePropertyProtocol {
 	/// - parameters:
 	///   - initialValue: Starting value for the mutable property.
 	public init(_ initialValue: Value) {
-		(signal, observer) = Signal.pipe()
+		(signal, observer) = Signal.pipe(attributes: .inheritSerialization)
 		token = Lifetime.Token()
 		lifetime = Lifetime(token)
 
@@ -666,8 +666,8 @@ public final class MutableProperty<Value>: ComposableMutablePropertyProtocol {
 		/// `value`. Note that recursive sets will still deadlock because the
 		/// underlying producer prevents sending recursive events.
 		atomic = RecursiveAtomic(initialValue,
-		                          name: "org.reactivecocoa.ReactiveSwift.MutableProperty",
-		                          didSet: observer.send(value:))
+		                         name: "org.reactivecocoa.ReactiveSwift.MutableProperty",
+		                         didSet: observer.send(value:))
 	}
 
 	/// Atomically replaces the contents of the variable.

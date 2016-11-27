@@ -42,9 +42,6 @@ public final class Signal<Value, Error: Swift.Error> {
 	/// Used to ensure that state updates are serialized.
 	private let updateLock: NSLock
 
-	/// Used to ensure that events are serialized during delivery to observers.
-	private let sendLock: NSLock
-
 	/// Initialize a Signal that will immediately invoke the given generator,
 	/// then forward events sent to the given observer.
 	///
@@ -55,14 +52,50 @@ public final class Signal<Value, Error: Swift.Error> {
 	/// - parameters:
 	///   - generator: A closure that accepts an implicitly created observer
 	///                that will act as an event emitter for the signal.
-	public init(_ generator: (Observer) -> Disposable?) {
+	public convenience init(_ generator: (Observer) -> Disposable?) {
+		self.init(.default, generator)
+	}
+
+	internal init(_ attributes: SignalAttributes, _ generator: (Observer) -> Disposable?) {
 		state = .alive(AliveState())
 		updateLock = NSLock()
 		updateLock.name = "org.reactivecocoa.ReactiveSwift.Signal.updateLock"
-		sendLock = NSLock()
+
+		if attributes.contains(.inheritSerialization) {
+			let observer = Observer { [weak self] event in
+				guard let signal = self else {
+					return
+				}
+
+				if event.isTerminating {
+					if case let .alive(state) = signal.state {
+						signal.updateLock.lock()
+						signal.state = .terminated
+						signal.updateLock.unlock()
+
+						for observer in state.observers {
+							observer.action(event)
+						}
+
+						signal.swapDisposable()?.dispose()
+					}
+				} else {
+					if case let .alive(state) = signal.state {
+						for observer in state.observers {
+							observer.action(event)
+						}
+					}
+				}
+			}
+
+			generatorDisposable = generator(observer)
+			return
+		}
+
+		let sendLock = NSLock()
 		sendLock.name = "org.reactivecocoa.ReactiveSwift.Signal.sendLock"
 
-		let observer = Observer { [weak self] event in
+		let observer = Observer { [sendLock, weak self] event in
 			guard let signal = self else {
 				return
 			}
@@ -162,11 +195,11 @@ public final class Signal<Value, Error: Swift.Error> {
 					signal.state = .terminating(newSnapshot)
 					signal.updateLock.unlock()
 
-					if signal.sendLock.try() {
+					if sendLock.try() {
 						// Check whether the terminating state has been handled by a
 						// concurrent sender. If not, handle it.
 						let shouldDispose = tryTerminate()
-						signal.sendLock.unlock()
+						sendLock.unlock()
 
 						if shouldDispose {
 							signal.swapDisposable()?.dispose()
@@ -196,7 +229,7 @@ public final class Signal<Value, Error: Swift.Error> {
 				// The related PR on the race conditions:
 				// https://github.com/ReactiveCocoa/ReactiveSwift/pull/112
 
-				signal.sendLock.lock()
+				sendLock.lock()
 				// Start of the main protected section.
 
 				if case let .alive(state) = signal.state {
@@ -212,15 +245,15 @@ public final class Signal<Value, Error: Swift.Error> {
 				}
 
 				// End of the main protected section.
-				signal.sendLock.unlock()
+				sendLock.unlock()
 
 				// Check if the status has been bumped to `terminating` due to a
 				// concurrent termination event that has not been caught in the main
 				// protected section.
 				if !shouldDispose, case .terminating = signal.state {
-					signal.sendLock.lock()
+					sendLock.lock()
 					shouldDispose = tryTerminate()
-					signal.sendLock.unlock()
+					sendLock.unlock()
 				}
 
 				if shouldDispose {
@@ -279,8 +312,12 @@ public final class Signal<Value, Error: Swift.Error> {
 	/// - returns: A tuple of `output: Signal`, the output end of the pipe,
 	///            and `input: Observer`, the input end of the pipe.
 	public static func pipe(disposable: Disposable? = nil) -> (output: Signal, input: Observer) {
+		return pipe(attributes: .default, disposable: disposable)
+	}
+
+	internal static func pipe(attributes: SignalAttributes, disposable: Disposable? = nil) -> (output: Signal, input: Observer) {
 		var observer: Observer!
-		let signal = self.init { innerObserver in
+		let signal = self.init(attributes) { innerObserver in
 			observer = innerObserver
 			return disposable
 		}
@@ -404,6 +441,22 @@ private final class TerminatingState<Value, Error: Swift.Error> {
 	init(observers: Bag<Signal<Value, Error>.Observer>, event: Event<Value, Error>) {
 		self.observers = observers
 		self.event = event
+	}
+}
+
+/// Describes how `Signal` should behave.
+internal struct SignalAttributes: OptionSet {
+	public let rawValue: Int
+
+	/// The `Signal` is inherently serialized. In other words, its owner promises to
+	/// enforce mutual exclusion of the emission of events.
+	public static let inheritSerialization = SignalAttributes(rawValue: 1 << 2)
+
+	/// The `Signal` is stateful, and should serialize all the received events.
+	public static let `default` = SignalAttributes(rawValue: 0)
+
+	public init(rawValue: Int) {
+		self.rawValue = rawValue
 	}
 }
 
@@ -534,7 +587,7 @@ extension Signal {
 	///
 	/// - returns: A signal that will send new values.
 	public func map<U>(_ transform: @escaping (Value) -> U) -> Signal<U, Error> {
-		return Signal<U, Error> { observer in
+		return Signal<U, Error>(.inheritSerialization) { observer in
 			return self.observe { event in
 				observer.action(event.map(transform))
 			}
@@ -549,7 +602,7 @@ extension Signal {
 	///
 	/// - returns: A signal that will send new type of errors.
 	public func mapError<F>(_ transform: @escaping (Error) -> F) -> Signal<Value, F> {
-		return Signal<Value, F> { observer in
+		return Signal<Value, F>(.inheritSerialization) { observer in
 			return self.observe { event in
 				observer.action(event.mapError(transform))
 			}
@@ -587,7 +640,7 @@ extension Signal {
 	/// - returns: A signal that will send only the values passing the given
 	///            predicate.
 	public func filter(_ predicate: @escaping (Value) -> Bool) -> Signal<Value, Error> {
-		return Signal { observer in
+		return Signal(.inheritSerialization) { observer in
 			return self.observe { (event: Event<Value, Error>) -> Void in
 				guard let value = event.value else {
 					observer.action(event)
@@ -649,7 +702,7 @@ extension Signal {
 	public func take(first count: Int) -> Signal<Value, Error> {
 		precondition(count >= 0)
 
-		return Signal { observer in
+		return Signal(.inheritSerialization) { observer in
 			if count == 0 {
 				observer.sendCompleted()
 				return nil
@@ -779,7 +832,7 @@ extension Signal {
 	///            `self` completes, forwards them as a single array and
 	///            complets.
 	public func collect(_ predicate: @escaping (_ values: [Value]) -> Bool) -> Signal<[Value], Error> {
-		return Signal<[Value], Error> { observer in
+		return Signal<[Value], Error>(.inheritSerialization) { observer in
 			let state = CollectState<Value>()
 
 			return self.observe { event in
@@ -844,7 +897,7 @@ extension Signal {
 	///            predicate which matches the values collected and the next
 	///            value.
 	public func collect(_ predicate: @escaping (_ values: [Value], _ value: Value) -> Bool) -> Signal<[Value], Error> {
-		return Signal<[Value], Error> { observer in
+		return Signal<[Value], Error>(.inheritSerialization) { observer in
 			let state = CollectState<Value>()
 
 			return self.observe { event in
@@ -877,7 +930,10 @@ extension Signal {
 	///
 	/// - returns: A signal that will yield `self` values on provided scheduler.
 	public func observe(on scheduler: Scheduler) -> Signal<Value, Error> {
-		return Signal { observer in
+		// While `observe` is an asynchronous operator, the resulting signal can
+		// inherit the serialization from the scheduler, since all the events
+		// are being forwarded through it.
+		return Signal(.inheritSerialization) { observer in
 			return self.observe { event in
 				scheduler.schedule {
 					observer.action(event)
@@ -895,33 +951,27 @@ private final class CombineLatestState<Value> {
 extension Signal {
 	private func observeWithStates<U>(_ signalState: CombineLatestState<Value>, _ otherState: CombineLatestState<U>, _ lock: NSLock, _ observer: Signal<(), Error>.Observer) -> Disposable? {
 		return self.observe { event in
+			lock.lock()
 			switch event {
 			case let .value(value):
-				lock.lock()
-
 				signalState.latestValue = value
 				if otherState.latestValue != nil {
 					observer.send(value: ())
 				}
 
-				lock.unlock()
-
 			case let .failed(error):
 				observer.send(error: error)
 
 			case .completed:
-				lock.lock()
-
 				signalState.isCompleted = true
 				if otherState.isCompleted {
 					observer.sendCompleted()
 				}
 
-				lock.unlock()
-
 			case .interrupted:
 				observer.sendInterrupted()
 			}
+			lock.unlock()
 		}
 	}
 
@@ -943,7 +993,9 @@ extension Signal {
 	/// - returns: A signal that will yield a tuple containing values of `self`
 	///            and given signal.
 	public func combineLatest<U>(with other: Signal<U, Error>) -> Signal<(Value, U), Error> {
-		return Signal<(Value, U), Error> { observer in
+		// The signal inherits the serialization from the lock, as all the events
+		// emitted happen within the lock's proected section.
+		return Signal<(Value, U), Error>(.inheritSerialization) { observer in
 			let lock = NSLock()
 			lock.name = "org.reactivecocoa.ReactiveSwift.combineLatestWith"
 
@@ -981,7 +1033,10 @@ extension Signal {
 	public func delay(_ interval: TimeInterval, on scheduler: DateScheduler) -> Signal<Value, Error> {
 		precondition(interval >= 0)
 
-		return Signal { observer in
+		// While `delay` is an asynchronous operator, the resulting signal can
+		// inherit the serialization from the scheduler, since all the events are
+		// forwarded through it.
+		return Signal(.inheritSerialization) { observer in
 			return self.observe { event in
 				switch event {
 				case .failed, .interrupted:
@@ -1015,7 +1070,7 @@ extension Signal {
 			return signal
 		}
 
-		return Signal { observer in
+		return Signal(.inheritSerialization) { observer in
 			var skipped = 0
 
 			return self.observe { event in
@@ -1040,7 +1095,7 @@ extension Signal {
 	///
 	/// - returns: A signal that sends events as its values.
 	public func materialize() -> Signal<Event<Value, Error>, NoError> {
-		return Signal<Event<Value, Error>, NoError> { observer in
+		return Signal<Event<Value, Error>, NoError>(.inheritSerialization) { observer in
 			return self.observe { event in
 				observer.send(value: event)
 
@@ -1065,7 +1120,7 @@ extension Signal where Value: EventProtocol, Error == NoError {
 	///
 	/// - returns: A signal that sends values carried by `self` events.
 	public func dematerialize() -> Signal<Value.Value, Value.Error> {
-		return Signal<Value.Value, Value.Error> { observer in
+		return Signal<Value.Value, Value.Error>(.inheritSerialization) { observer in
 			return self.observe { event in
 				switch event {
 				case let .value(innerEvent):
@@ -1109,7 +1164,7 @@ extension Signal {
 		disposed: (() -> Void)? = nil,
 		value: ((Value) -> Void)? = nil
 	) -> Signal<Value, Error> {
-		return Signal { observer in
+		return Signal(.inheritSerialization) { observer in
 			let disposable = CompositeDisposable()
 
 			_ = disposed.map(disposable.add)
@@ -1445,7 +1500,7 @@ extension Signal {
 	/// - returns: A signal that sends accumulated value each time `self` emits
 	///            own value.
 	public func scan<U>(_ initial: U, _ combine: @escaping (U, Value) -> U) -> Signal<U, Error> {
-		return Signal<U, Error> { observer in
+		return Signal<U, Error>(.inheritSerialization) { observer in
 			var accumulator = initial
 
 			return self.observe { event in
@@ -1508,7 +1563,7 @@ extension Signal {
 	///
 	/// - returns: A signal that sends only forwarded values from `self`.
 	public func skip(while predicate: @escaping (Value) -> Bool) -> Signal<Value, Error> {
-		return Signal { observer in
+		return Signal(.inheritSerialization) { observer in
 			var shouldSkip = true
 
 			return self.observe { event in
@@ -1571,7 +1626,7 @@ extension Signal {
 	/// - returns: A signal that receives up to `count` values from `self`
 	///            after `self` completes.
 	public func take(last count: Int) -> Signal<Value, Error> {
-		return Signal { observer in
+		return Signal(.inheritSerialization) { observer in
 			var buffer: [Value] = []
 			buffer.reserveCapacity(count)
 
@@ -1610,7 +1665,7 @@ extension Signal {
 	/// - returns: A signal that sends events until the values sent by `self`
 	///            pass the given `predicate`.
 	public func take(while predicate: @escaping (Value) -> Bool) -> Signal<Value, Error> {
-		return Signal { observer in
+		return Signal(.inheritSerialization) { observer in
 			return self.observe { event in
 				if let value = event.value, !predicate(value) {
 					observer.sendCompleted()
@@ -1750,7 +1805,10 @@ extension Signal {
 	public func throttle(_ interval: TimeInterval, on scheduler: DateScheduler) -> Signal<Value, Error> {
 		precondition(interval >= 0)
 
-		return Signal { observer in
+		// While `throttle` is an asynchronous operator, the resulting signal can
+		// inherit the serialization from the scheduler, since all events are being
+		// forwarded through it.
+		return Signal(.inheritSerialization) { observer in
 			let state: Atomic<ThrottleState<Value>> = Atomic(ThrottleState())
 			let schedulerDisposable = SerialDisposable()
 
@@ -1960,7 +2018,7 @@ extension Signal {
 	///
 	/// - returns: A signal that sends unique values during its lifetime.
 	public func uniqueValues<Identity: Hashable>(_ transform: @escaping (Value) -> Identity) -> Signal<Value, Error> {
-		return Signal { observer in
+		return Signal(.inheritSerialization) { observer in
 			var seenValues: Set<Identity> = []
 			
 			return self
@@ -2238,7 +2296,7 @@ extension Signal where Error == NoError {
 	///
 	/// - returns: A signal that has an instantiatable `ErrorType`.
 	public func promoteErrors<F: Swift.Error>(_: F.Type) -> Signal<Value, F> {
-		return Signal<Value, F> { observer in
+		return Signal<Value, F>(.inheritSerialization) { observer in
 			return self.observe { event in
 				switch event {
 				case let .value(value):
