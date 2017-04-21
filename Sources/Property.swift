@@ -90,13 +90,13 @@ public protocol ComposableMutablePropertyProtocol: MutablePropertyProtocol {
 extension PropertyProtocol {
 	/// Lifts a unary SignalProducer operator to operate upon PropertyProtocol instead.
 	fileprivate func lift<U>(_ transform: @escaping (SignalProducer<Value, NoError>) -> SignalProducer<U, NoError>) -> Property<U> {
-		return Property(self, transform: transform)
+		return Property(unsafeProducer: transform(producer))
 	}
 
 	/// Lifts a binary SignalProducer operator to operate upon PropertyProtocol instead.
 	fileprivate func lift<P: PropertyProtocol, U>(_ transform: @escaping (SignalProducer<Value, NoError>) -> (SignalProducer<P.Value, NoError>) -> SignalProducer<U, NoError>) -> (P) -> Property<U> {
-		return { otherProperty in
-			return Property(self, otherProperty, transform: transform)
+		return { other in
+			return Property(unsafeProducer: transform(self.producer)(other.producer))
 		}
 	}
 
@@ -459,11 +459,7 @@ extension PropertyProtocol where Value == Bool {
 ///
 /// Note that composed properties do not retain any of its sources.
 public final class Property<Value>: PropertyProtocol {
-	private let disposable: Disposable?
-
 	private let _value: () -> Value
-	private let _producer: () -> SignalProducer<Value, NoError>
-	private let _signal: () -> Signal<Value, NoError>
 
 	/// The current value of the property.
 	public var value: Value {
@@ -476,28 +472,23 @@ public final class Property<Value>: PropertyProtocol {
 	///
 	/// - note: If `self` is a composed property, the producer would be
 	///         bound to the lifetime of its sources.
-	public var producer: SignalProducer<Value, NoError> {
-		return _producer()
-	}
+	public let producer: SignalProducer<Value, NoError>
 
 	/// A signal that will send the property's changes over time, then
 	/// complete when the property has deinitialized or has no further changes.
 	///
 	/// - note: If `self` is a composed property, the signal would be
 	///         bound to the lifetime of its sources.
-	public var signal: Signal<Value, NoError> {
-		return _signal()
-	}
+	public let signal: Signal<Value, NoError>
 
 	/// Initializes a constant property.
 	///
 	/// - parameters:
 	///   - property: A value of the constant property.
 	public init(value: Value) {
-		disposable = nil
 		_value = { value }
-		_producer = { SignalProducer(value: value) }
-		_signal = { Signal<Value, NoError>.empty }
+		producer = SignalProducer(value: value)
+		signal = Signal<Value, NoError>.empty
 	}
 
 	/// Initializes an existential property which wraps the given property.
@@ -507,10 +498,9 @@ public final class Property<Value>: PropertyProtocol {
 	/// - parameters:
 	///   - property: A property to be wrapped.
 	public init<P: PropertyProtocol>(capturing property: P) where P.Value == Value {
-		disposable = nil
 		_value = { property.value }
-		_producer = { property.producer }
-		_signal = { property.signal }
+		producer = property.producer
+		signal = property.signal
 	}
 
 	/// Initializes a composed property which reflects the given property.
@@ -531,7 +521,8 @@ public final class Property<Value>: PropertyProtocol {
 	///   - values: A producer that will start immediately and send values to
 	///             the property.
 	public convenience init(initial: Value, then values: SignalProducer<Value, NoError>) {
-		self.init(unsafeProducer: values.prefix(value: initial))
+		self.init(unsafeProducer: values.prefix(value: initial),
+		          transform: Observer.init(mappingInterruptedToCompleted:))
 	}
 
 	/// Initialize a composed property that first takes on `initial`, then each
@@ -541,33 +532,8 @@ public final class Property<Value>: PropertyProtocol {
 	///   - initialValue: Starting value for the property.
 	///   - values: A signal that will send values to the property.
 	public convenience init(initial: Value, then values: Signal<Value, NoError>) {
-		self.init(unsafeProducer: SignalProducer(values).prefix(value: initial))
-	}
-
-	/// Initialize a composed property by applying the unary `SignalProducer`
-	/// transform on `property`.
-	///
-	/// - parameters:
-	///   - property: The source property.
-	///   - transform: A unary `SignalProducer` transform to be applied on
-	///     `property`.
-	fileprivate convenience init<P: PropertyProtocol>(
-		_ property: P,
-		transform: @escaping (SignalProducer<P.Value, NoError>) -> SignalProducer<Value, NoError>
-	) {
-		self.init(unsafeProducer: transform(property.producer))
-	}
-
-	/// Initialize a composed property by applying the binary `SignalProducer`
-	/// transform on `firstProperty` and `secondProperty`.
-	///
-	/// - parameters:
-	///   - firstProperty: The first source property.
-	///   - secondProperty: The first source property.
-	///   - transform: A binary `SignalProducer` transform to be applied on
-	///             `firstProperty` and `secondProperty`.
-	fileprivate convenience init<P1: PropertyProtocol, P2: PropertyProtocol>(_ firstProperty: P1, _ secondProperty: P2, transform: @escaping (SignalProducer<P1.Value, NoError>) -> (SignalProducer<P2.Value, NoError>) -> SignalProducer<Value, NoError>) {
-		self.init(unsafeProducer: transform(firstProperty.producer)(secondProperty.producer))
+		self.init(unsafeProducer: SignalProducer(values).prefix(value: initial),
+		          transform: Observer.init(mappingInterruptedToCompleted:))
 	}
 
 	/// Initialize a composed property from a producer that promises to send
@@ -580,30 +546,69 @@ public final class Property<Value>: PropertyProtocol {
 	/// - warning: If the producer fails its promise, a fatal error would be
 	///            raised.
 	///
+	/// - warning: `unsafeProducer` should not emit any `interrupted` event unless it is
+	///            a result of being interrupted by the downstream.
+	///
 	/// - parameters:
 	///   - unsafeProducer: The composed producer for creating the property.
-	private init(unsafeProducer: SignalProducer<Value, NoError>) {
-		// Share a replayed producer with `self.producer` and `self.signal` so
-		// they see a consistent view of the `self.value`.
-		// https://github.com/ReactiveCocoa/ReactiveCocoa/pull/3042
-		let producer = unsafeProducer.replayLazily(upTo: 1)
+	fileprivate init(
+		unsafeProducer: SignalProducer<Value, NoError>,
+	    transform: ((Observer<Value, NoError>) -> Observer<Value, NoError>)? = nil
+	) {
+		// The ownership graph:
+		//
+		// ------------     weak  -----------    strong ------------------
+		// | Upstream | ~~~~~~~~> |   Box   | <======== | SignalProducer | <=== strong
+		// ------------           -----------       //  ------------------    \\
+		//  \\                                     //                          \\
+		//   \\   ------------ weak  ----------- <==                          ------------
+		//    ==> | Observer | ~~~~> |  Relay  | <=========================== | Property |
+		// strong ------------       -----------                       strong ------------
 
-		let atomic = Atomic<Value?>(nil)
-		disposable = producer.startWithValues { atomic.value = $0 }
+		let box = PropertyBox<Value?>(nil)
+		var relay: Signal<Value, NoError>!
+
+		unsafeProducer.startWithSignal { upstream, interruptHandle in
+			// A composed property tracks its active consumers through its relay signal, and
+			// interrupts `unsafeProducer` if the relay signal terminates.
+			let (signal, _observer) = Signal<Value, NoError>.pipe(disposable: interruptHandle)
+			let observer = transform?(_observer) ?? _observer
+			relay = signal
+
+			// `observer` receives `interrupted` only as a result of the termination of
+			// `signal`, and would not be delivered anyway. So transforming
+			// `interrupted` to `completed` is unnecessary here.
+			upstream.observe { [weak box] event in
+				guard let box = box else {
+					// Just forward the event, since no one owns the box or IOW no demand
+					// for a cached latest value.
+					return observer.action(event)
+				}
+
+				box.lock.sync {
+					if let value = event.value {
+						box.value = value
+					}
+					observer.action(event)
+				}
+			}
+		}
 
 		// Verify that an initial is sent. This is friendlier than deadlocking
 		// in the event that one isn't.
-		guard atomic.value != nil else {
-			fatalError("A producer promised to send at least one value. Received none.")
+		guard box.lock.sync({ box.value != nil }) else {
+			fatalError("The producer promised to send at least one value. Received none.")
 		}
 
-		_value = { atomic.value! }
-		_producer = { producer }
-		_signal = { producer.startAndRetrieveSignal() }
-	}
+		_value = { box.lock.sync { box.value! } }
+		signal = relay
 
-	deinit {
-		disposable?.dispose()
+		producer = SignalProducer { [box, signal = relay!] observer, disposable in
+			box.lock.sync {
+				observer.send(value: box.value!)
+				disposable += signal.observe(Observer(mappingInterruptedToCompleted: observer))
+			}
+		}
 	}
 }
 
@@ -613,20 +618,15 @@ public final class Property<Value>: PropertyProtocol {
 public final class MutableProperty<Value>: ComposableMutablePropertyProtocol {
 	private let token: Lifetime.Token
 	private let observer: Signal<Value, NoError>.Observer
-	private let atomic: RecursiveAtomic<Value>
+	private let box: PropertyBox<Value>
 
 	/// The current value of the property.
 	///
 	/// Setting this to a new value will notify all observers of `signal`, or
 	/// signals created using `producer`.
 	public var value: Value {
-		get {
-			return atomic.withValue { $0 }
-		}
-
-		set {
-			swap(newValue)
-		}
+		get { return box.lock.sync { box.value } }
+		set { modify { $0 = newValue } }
 	}
 
 	/// The lifetime of the property.
@@ -640,15 +640,10 @@ public final class MutableProperty<Value>: ComposableMutablePropertyProtocol {
 	/// followed by all changes over time, then complete when the property has
 	/// deinitialized.
 	public var producer: SignalProducer<Value, NoError> {
-		return SignalProducer { [atomic, weak self] producerObserver, producerDisposable in
-			atomic.withValue { value in
-				if let strongSelf = self {
-					producerObserver.send(value: value)
-					producerDisposable += strongSelf.signal.observe(producerObserver)
-				} else {
-					producerObserver.send(value: value)
-					producerObserver.sendCompleted()
-				}
+		return SignalProducer { [box, signal] observer, disposable in
+			box.lock.sync {
+				observer.send(value: box.value)
+				disposable += signal.observe(Observer(mappingInterruptedToCompleted: observer))
 			}
 		}
 	}
@@ -665,9 +660,7 @@ public final class MutableProperty<Value>: ComposableMutablePropertyProtocol {
 		/// Need a recursive lock around `value` to allow recursive access to
 		/// `value`. Note that recursive sets will still deadlock because the
 		/// underlying producer prevents sending recursive events.
-		atomic = RecursiveAtomic(initialValue,
-		                          name: "org.reactivecocoa.ReactiveSwift.MutableProperty",
-		                          didSet: observer.send(value:))
+		box = PropertyBox(initialValue)
 	}
 
 	/// Atomically replaces the contents of the variable.
@@ -678,7 +671,10 @@ public final class MutableProperty<Value>: ComposableMutablePropertyProtocol {
 	/// - returns: The previous property value.
 	@discardableResult
 	public func swap(_ newValue: Value) -> Value {
-		return atomic.swap(newValue)
+		return modify { value in
+			defer { value = newValue }
+			return value
+		}
 	}
 
 	/// Atomically modifies the variable.
@@ -690,7 +686,10 @@ public final class MutableProperty<Value>: ComposableMutablePropertyProtocol {
 	/// - returns: The result of the action.
 	@discardableResult
 	public func modify<Result>(_ action: (inout Value) throws -> Result) rethrows -> Result {
-		return try atomic.modify(action)
+		return try box.lock.sync {
+			defer { observer.send(value: box.value) }
+			return try action(&box.value)
+		}
 	}
 
 	/// Atomically performs an arbitrary action using the current value of the
@@ -702,10 +701,43 @@ public final class MutableProperty<Value>: ComposableMutablePropertyProtocol {
 	/// - returns: the result of the action.
 	@discardableResult
 	public func withValue<Result>(_ action: (Value) throws -> Result) rethrows -> Result {
-		return try atomic.withValue(action)
+		return try box.lock.sync { try action(box.value) }
 	}
 
 	deinit {
 		observer.sendCompleted()
+	}
+}
+
+/// A reference counted box which holds a recursive lock and a value storage.
+///
+/// The requirement of a `Value?` storage from composed properties prevents further
+/// implementation sharing with `MutableProperty`.
+private final class PropertyBox<Value> {
+	let lock = NSRecursiveLock()
+	var value: Value
+
+	init(_ value: Value) {
+		self.value = value
+	}
+}
+
+extension NSRecursiveLock {
+	fileprivate func sync<Result>(_ action: () throws -> Result) rethrows -> Result {
+		lock(); defer { unlock() }
+		return try action()
+	}
+}
+
+private extension Observer {
+	convenience init(mappingInterruptedToCompleted observer: Observer<Value, Error>) {
+		self.init { event in
+			switch event {
+			case .value, .completed, .failed:
+				observer.action(event)
+			case .interrupted:
+				observer.sendCompleted()
+			}
+		}
 	}
 }

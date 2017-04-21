@@ -332,6 +332,7 @@ class PropertySpec: QuickSpec {
 
 					var sentValue: String?
 					var signalCompleted = false
+					var hasUnexpectedEventsEmitted = false
 
 					constantProperty.producer.start { event in
 						switch event {
@@ -340,12 +341,13 @@ class PropertySpec: QuickSpec {
 						case .completed:
 							signalCompleted = true
 						case .failed, .interrupted:
-							break
+							hasUnexpectedEventsEmitted = true
 						}
 					}
 
 					expect(sentValue) == initialPropertyValue
 					expect(signalCompleted) == true
+					expect(hasUnexpectedEventsEmitted) == false
 				}
 			}
 
@@ -359,6 +361,7 @@ class PropertySpec: QuickSpec {
 						var signalSentValue: String?
 						var producerCompleted = false
 						var signalInterrupted = false
+						var hasUnexpectedEventsEmitted = false
 
 						property.producer.start { event in
 							switch event {
@@ -367,18 +370,16 @@ class PropertySpec: QuickSpec {
 							case .completed:
 								producerCompleted = true
 							case .failed, .interrupted:
-								break
+								hasUnexpectedEventsEmitted = true
 							}
 						}
 
 						property.signal.observe { event in
 							switch event {
-							case let .value(value):
-								signalSentValue = value
 							case .interrupted:
 								signalInterrupted = true
-							case .failed, .completed:
-								break
+							case .value, .failed, .completed:
+								hasUnexpectedEventsEmitted = true
 							}
 						}
 
@@ -386,6 +387,7 @@ class PropertySpec: QuickSpec {
 						expect(signalSentValue).to(beNil())
 						expect(producerCompleted) == true
 						expect(signalInterrupted) == true
+						expect(hasUnexpectedEventsEmitted) == false
 					}
 
 					it("should retain the wrapped property") {
@@ -414,6 +416,7 @@ class PropertySpec: QuickSpec {
 						var signalSentValue: String?
 						var producerCompleted = false
 						var signalInterrupted = false
+						var hasUnexpectedEventsEmitted = false
 
 						property.producer.start { event in
 							switch event {
@@ -422,18 +425,16 @@ class PropertySpec: QuickSpec {
 							case .completed:
 								producerCompleted = true
 							case .failed, .interrupted:
-								break
+								hasUnexpectedEventsEmitted = true
 							}
 						}
 
 						property.signal.observe { event in
 							switch event {
-							case let .value(value):
-								signalSentValue = value
 							case .interrupted:
 								signalInterrupted = true
-							case .failed, .completed:
-								break
+							case .value, .failed, .completed:
+								hasUnexpectedEventsEmitted = true
 							}
 						}
 
@@ -441,6 +442,7 @@ class PropertySpec: QuickSpec {
 						expect(signalSentValue).to(beNil())
 						expect(producerCompleted) == true
 						expect(signalInterrupted) == true
+						expect(hasUnexpectedEventsEmitted) == false
 					}
 
 					it("should not retain the wrapped property, and remain accessible after its the property being reflected has deinitialized.") {
@@ -592,16 +594,34 @@ class PropertySpec: QuickSpec {
 				describe("from a value and SignalProducer") {
 					it("should initially take on the supplied value") {
 						let property = Property(initial: initialPropertyValue,
-																		then: SignalProducer.never)
+						                        then: SignalProducer.never)
 
 						expect(property.value) == initialPropertyValue
 					}
 
 					it("should take on each value sent on the producer") {
 						let property = Property(initial: initialPropertyValue,
-																		then: SignalProducer(value: subsequentPropertyValue))
+						                        then: SignalProducer(value: subsequentPropertyValue))
 
 						expect(property.value) == subsequentPropertyValue
+					}
+
+					it("should complete its producer and signal even if the upstream interrupts") {
+						let (signal, observer) = Signal<String, NoError>.pipe()
+
+						let property = Property(initial: initialPropertyValue, then: SignalProducer(signal))
+
+						var isProducerCompleted = false
+						var isSignalCompleted = false
+
+						property.producer.startWithCompleted { isProducerCompleted = true }
+						property.signal.observeCompleted { isSignalCompleted = true }
+						expect(isProducerCompleted) == false
+						expect(isSignalCompleted) == false
+
+						observer.sendInterrupted()
+						expect(isProducerCompleted) == true
+						expect(isSignalCompleted) == true
 					}
 
 					it("should return a producer and a signal that respect the lifetime of its ultimate source") {
@@ -610,8 +630,7 @@ class PropertySpec: QuickSpec {
 						var signalInterrupted = false
 
 						let (signal, observer) = Signal<Int, NoError>.pipe()
-						var property: Property<Int>? = Property(initial: 1,
-						                                        then: SignalProducer(signal))
+						var property: Property<Int>? = Property(initial: 1, then: SignalProducer(signal))
 						let propertySignal = property!.signal
 
 						propertySignal.observeCompleted { signalCompleted = true }
@@ -641,8 +660,7 @@ class PropertySpec: QuickSpec {
 					it("should initially take on the supplied value, then values sent on the signal") {
 						let (signal, observer) = Signal<String, NoError>.pipe()
 
-						let property = Property(initial: initialPropertyValue,
-																		then: signal)
+						let property = Property(initial: initialPropertyValue, then: signal)
 
 						expect(property.value) == initialPropertyValue
 
@@ -651,6 +669,23 @@ class PropertySpec: QuickSpec {
 						expect(property.value) == subsequentPropertyValue
 					}
 
+					it("should complete its producer and signal even if the upstream interrupts") {
+						let (signal, observer) = Signal<String, NoError>.pipe()
+
+						let property = Property(initial: initialPropertyValue, then: signal)
+
+						var isProducerCompleted = false
+						var isSignalCompleted = false
+
+						property.producer.startWithCompleted { isProducerCompleted = true }
+						property.signal.observeCompleted { isSignalCompleted = true }
+						expect(isProducerCompleted) == false
+						expect(isSignalCompleted) == false
+
+						observer.sendInterrupted()
+						expect(isProducerCompleted) == true
+						expect(isSignalCompleted) == true
+					}
 
 					it("should return a producer and a signal that respect the lifetime of its ultimate source") {
 						var signalCompleted = false
@@ -658,8 +693,7 @@ class PropertySpec: QuickSpec {
 						var signalInterrupted = false
 
 						let (signal, observer) = Signal<Int, NoError>.pipe()
-						var property: Property<Int>? = Property(initial: 1,
-																											 then: signal)
+						var property: Property<Int>? = Property(initial: 1, then: signal)
 						let propertySignal = property!.signal
 
 						propertySignal.observeCompleted { signalCompleted = true }
