@@ -82,6 +82,26 @@ public struct SignalProducer<Value, Error: Swift.Error> {
 		}
 	}
 
+	/// Create a `SignalProducer` that will attempt the given operation once for
+	/// each invocation of `start()`.
+	///
+	/// Upon success, the started signal will send the resulting value then
+	/// complete. Upon failure, the started signal will fail with the error that
+	/// occurred.
+	///
+	/// - parameters:
+	///   - action: A closure that returns instance of `Result`.
+	public init(_ action: @escaping () -> Result<Value, Error>) {
+		self.init { observer, disposable in
+			action().analysis(ifSuccess: { value in
+				observer.send(value: value)
+				observer.sendCompleted()
+			}, ifFailure: { error in
+				observer.send(error: error)
+			})
+		}
+	}
+
 	/// Creates a producer for a `Signal` that will immediately fail with the
 	/// given error.
 	///
@@ -182,6 +202,25 @@ public struct SignalProducer<Value, Error: Swift.Error> {
 		}
 
 		startHandler(observer, producerDisposable)
+	}
+}
+
+extension SignalProducer where Error == AnyError {
+	/// Create a `SignalProducer` that will attempt the given failable operation once for
+	/// each invocation of `start()`.
+	///
+	/// Upon success, the started producer will send the resulting value then
+	/// complete. Upon failure, the started signal will fail with the error that
+	/// occurred.
+	///
+	/// - parameters:
+	///   - operation: A failable closure.
+	public init(_ action: @escaping () throws -> Value) {
+		self.init {
+			return ReactiveSwift.materialize {
+				return try action()
+			}
+		}
 	}
 }
 
@@ -1277,60 +1316,6 @@ extension SignalProducer where Error == NoError {
 	///            or thrown errors as `failed` events.
 	public func attemptMap<U>(_ operation: @escaping (Value) throws -> U) -> SignalProducer<U, AnyError> {
 		return lift { $0.attemptMap(operation) }
-	}
-}
-
-extension SignalProducer {
-	/// Create a `SignalProducer` that will attempt the given operation once for
-	/// each invocation of `start()`.
-	///
-	/// Upon success, the started signal will send the resulting value then
-	/// complete. Upon failure, the started signal will fail with the error that
-	/// occurred.
-	///
-	/// - parameters:
-	///   - operation: A closure that returns instance of `Result`.
-	///
-	/// - returns: A `SignalProducer` that will forward `success`ful `result` as
-	///            `value` event and then complete or `failed` event if `result`
-	///            is a `failure`.
-	public static func attempt(_ operation: @escaping () -> Result<Value, Error>) -> SignalProducer<Value, Error> {
-		return SignalProducer<Value, Error> { observer, disposable in
-			operation().analysis(ifSuccess: { value in
-				observer.send(value: value)
-				observer.sendCompleted()
-				}, ifFailure: { error in
-					observer.send(error: error)
-			})
-		}
-	}
-}
-
-// FIXME: SWIFT_COMPILER_ISSUE
-//
-// One of the `SignalProducer.attempt` overloads is kept in the protocol to
-// mitigate an overloading issue. Moving them back to the concrete type would be
-// a binary-breaking, source-compatible change.
-
-extension SignalProducerProtocol where Error == AnyError {
-	/// Create a `SignalProducer` that will attempt the given failable operation once for
-	/// each invocation of `start()`.
-	///
-	/// Upon success, the started producer will send the resulting value then
-	/// complete. Upon failure, the started signal will fail with the error that
-	/// occurred.
-	///
-	/// - parameters:
-	///   - operation: A failable closure.
-	///
-	/// - returns: A `SignalProducer` that will forward a success as a `value`
-	///            event and then complete or `failed` event if the closure throws.
-	public static func attempt(_ operation: @escaping () throws -> Value) -> SignalProducer<Value, AnyError> {
-		return .attempt {
-			ReactiveSwift.materialize {
-				try operation()
-			}
-		}
 	}
 }
 

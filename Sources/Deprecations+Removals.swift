@@ -1,8 +1,18 @@
 import Foundation
 import Dispatch
-import enum Result.NoError
+import Result
 
 // MARK: Unavailable methods in ReactiveSwift 2.0.
+extension SignalProducerProtocol {
+	@available(*, unavailable, renamed:"init(_:)")
+	public static func attempt(_ operation: @escaping () -> Result<Value, Error>) -> SignalProducer<Value, Error> { fatalError() }
+}
+
+extension SignalProducerProtocol where Error == AnyError {
+	@available(*, unavailable, renamed:"init(_:)")
+	public static func attempt(_ operation: @escaping () throws -> Value) -> SignalProducer<Value, Error> { fatalError() }
+}
+
 @available(*, unavailable, renamed:"SignalProducer.timer")
 public func timer(interval: DispatchTimeInterval, on scheduler: DateScheduler) -> SignalProducer<Date, NoError> { fatalError() }
 
