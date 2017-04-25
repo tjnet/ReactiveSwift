@@ -426,6 +426,12 @@ extension Signal: SignalProtocol {
 	}
 }
 
+extension Signal: SignalProducerRepresentable {
+	public var producer: SignalProducer<Value, Error> {
+		return SignalProducer(self)
+	}
+}
+
 extension Signal {
 	/// Convenience override for observe(_:) to allow trailing-closure style
 	/// invocations.
