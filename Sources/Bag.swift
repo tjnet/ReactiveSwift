@@ -36,15 +36,17 @@ public struct Bag<Element> {
 	///
 	/// - parameters:
 	///   - token: A token returned from a call to `insert()`.
-	public mutating func remove(using token: RemovalToken) {
+	@discardableResult
+	public mutating func remove(using token: RemovalToken) -> Element? {
 		let tokenIdentifier = ObjectIdentifier(token)
 		// Removal is more likely for recent objects than old ones.
 		for i in elements.indices.reversed() {
 			if ObjectIdentifier(elements[i].token) == tokenIdentifier {
-				elements.remove(at: i)
-				break
+				return elements.remove(at: i).value
 			}
 		}
+
+		return nil
 	}
 }
 

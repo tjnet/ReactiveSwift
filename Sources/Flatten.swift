@@ -824,29 +824,35 @@ extension Signal where Value: SignalProducerProtocol, Error == Value.Error {
 					}
 
 					let disposableHandle = relayDisposable.add(innerDisposable)
+					var hasWon = false
 
-					innerSignal.observe { [unowned innerSignal] event in
-
-						let isWinningSignal: Bool = state.modify { state in
-							if state.active == nil {
-								state.active = innerSignal
-							}
-							return state.active === innerSignal
-						}
-
+					innerSignal.observe { event in
 						// Ignore non-winning signals.
-						guard isWinningSignal else { return }
+						if !hasWon {
+							let shouldDispose: Bool = state.modify { state in
+								if !state.active {
+									state.active = true
+									hasWon = true
+									return true
+								}
 
-						// Dispose all running innerSignals except winning one.
-						if !relayDisposable.isDisposed {
-							disposableHandle.remove()
-							relayDisposable.dispose()
+								return false
+							}
+
+							// Dispose all running innerSignals except winning one.
+							if shouldDispose {
+								disposableHandle.remove()
+								relayDisposable.dispose()
+							}
+
+							if !hasWon {
+								return
+							}
 						}
 
 						switch event {
 						case .completed:
 							let shouldComplete: Bool = state.modify { state in
-								state.active = nil
 								state.innerSignalComplete = true
 								return state.outerSignalComplete
 							}
@@ -906,7 +912,7 @@ private struct RaceState<Value, Error: Swift.Error> {
 	var outerSignalComplete: Bool = false
 	var innerSignalComplete: Bool = true
 
-	var active: Signal<Value, Error>? = nil
+	var active: Bool = false
 }
 
 extension Signal {
