@@ -30,19 +30,6 @@ public protocol PropertyProtocol: class, BindingSource {
 	var signal: Signal<Value, NoError> { get }
 }
 
-extension PropertyProtocol {
-	/// Observe the property by sending all of future value changes to the
-	/// given `observer` during the given `lifetime`.
-	///
-	/// - parameters:
-	///   - observer: An observer to send the events to.
-	///   - lifetime: A lifetime of the observing object.
-	@discardableResult
-	public func observe(_ observer: Observer<Value, NoError>, during lifetime: Lifetime) -> Disposable? {
-		return producer.observe(observer, during: lifetime)
-	}
-}
-
 /// Represents an observable property that can be mutated directly.
 public protocol MutablePropertyProtocol: PropertyProtocol, BindingTargetProvider {
 	/// The current value of the property.
@@ -197,7 +184,7 @@ extension PropertyProtocol {
 	///   - transform: The transform to be applied on `self` before flattening.
 	///
 	/// - returns: A property that sends the values of its inner properties.
-	public func flatMap<P: PropertyProtocol>(_ strategy: FlattenStrategy, transform: @escaping (Value) -> P) -> Property<P.Value> {
+	public func flatMap<P: PropertyProtocol>(_ strategy: FlattenStrategy, _ transform: @escaping (Value) -> P) -> Property<P.Value> {
 		return lift { $0.flatMap(strategy) { transform($0).producer } }
 	}
 
@@ -521,8 +508,10 @@ public final class Property<Value>: PropertyProtocol {
 	///   - values: A producer that will start immediately and send values to
 	///             the property.
 	public convenience init(initial: Value, then values: SignalProducer<Value, NoError>) {
-		self.init(unsafeProducer: values.prefix(value: initial),
-		          transform: Observer.init(mappingInterruptedToCompleted:))
+		self.init(unsafeProducer: SignalProducer { observer, disposables in
+			observer.send(value: initial)
+			disposables += values.start(Observer(mappingInterruptedToCompleted: observer))
+		})
 	}
 
 	/// Initialize a composed property that first takes on `initial`, then each
@@ -532,8 +521,7 @@ public final class Property<Value>: PropertyProtocol {
 	///   - initialValue: Starting value for the property.
 	///   - values: A signal that will send values to the property.
 	public convenience init(initial: Value, then values: Signal<Value, NoError>) {
-		self.init(unsafeProducer: SignalProducer(values).prefix(value: initial),
-		          transform: Observer.init(mappingInterruptedToCompleted:))
+		self.init(initial: initial, then: SignalProducer(values))
 	}
 
 	/// Initialize a composed property from a producer that promises to send
@@ -552,8 +540,7 @@ public final class Property<Value>: PropertyProtocol {
 	/// - parameters:
 	///   - unsafeProducer: The composed producer for creating the property.
 	fileprivate init(
-		unsafeProducer: SignalProducer<Value, NoError>,
-	    transform: ((Observer<Value, NoError>) -> Observer<Value, NoError>)? = nil
+		unsafeProducer: SignalProducer<Value, NoError>
 	) {
 		// The ownership graph:
 		//
@@ -571,8 +558,7 @@ public final class Property<Value>: PropertyProtocol {
 		unsafeProducer.startWithSignal { upstream, interruptHandle in
 			// A composed property tracks its active consumers through its relay signal, and
 			// interrupts `unsafeProducer` if the relay signal terminates.
-			let (signal, _observer) = Signal<Value, NoError>.pipe(disposable: interruptHandle)
-			let observer = transform?(_observer) ?? _observer
+			let (signal, observer) = Signal<Value, NoError>.pipe(disposable: interruptHandle)
 			relay = signal
 
 			// `observer` receives `interrupted` only as a result of the termination of
@@ -640,10 +626,10 @@ public final class MutableProperty<Value>: ComposableMutablePropertyProtocol {
 	/// followed by all changes over time, then complete when the property has
 	/// deinitialized.
 	public var producer: SignalProducer<Value, NoError> {
-		return SignalProducer { [box, signal] observer, disposable in
-			box.lock.sync {
-				observer.send(value: box.value)
-				disposable += signal.observe(Observer(mappingInterruptedToCompleted: observer))
+		return SignalProducer { [atomic, signal] producerObserver, producerDisposable in
+			atomic.withValue { value in
+				producerObserver.send(value: value)
+				producerDisposable += signal.observe(Observer(mappingInterruptedToCompleted: producerObserver))
 			}
 		}
 	}
