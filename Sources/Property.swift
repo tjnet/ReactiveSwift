@@ -1,4 +1,8 @@
-import Foundation
+#if os(iOS) || os(macOS) || os(tvOS) || os(watchOS)
+import Darwin.POSIX.pthread
+#else
+import Glibc
+#endif
 import enum Result.NoError
 
 /// Represents a property that allows observation of its changes.
@@ -698,16 +702,44 @@ public final class MutableProperty<Value>: ComposableMutablePropertyProtocol {
 /// The requirement of a `Value?` storage from composed properties prevents further
 /// implementation sharing with `MutableProperty`.
 private final class PropertyBox<Value> {
-	private let lock = NSRecursiveLock()
+	private var mutex: pthread_mutex_t
 	private var _value: Value
 	var value: Value { return modify { $0 } }
 
 	init(_ value: Value) {
 		self._value = value
+		self.mutex = pthread_mutex_t()
+
+		withUnsafeMutablePointer(to: &mutex) { mutexPointer in
+			var attr = pthread_mutexattr_t()
+			withUnsafeMutablePointer(to: &attr) { attrPointer in
+				pthread_mutexattr_init(attrPointer)
+				pthread_mutexattr_settype(attrPointer, Int32(PTHREAD_MUTEX_RECURSIVE))
+				#if os(iOS) || os(macOS) || os(tvOS) || os(watchOS)
+				// The pthread mutex implementation of Darwin guarantees fairness by
+				// default. Since fairness is not a concern of properties anyway, it can
+				// be disabled.
+				pthread_mutexattr_setpolicy_np(attrPointer, _PTHREAD_MUTEX_POLICY_FIRSTFIT)
+				#endif
+
+				pthread_mutex_init(mutexPointer, attrPointer)
+			}
+		}
+	}
+
+	deinit {
+		_ = withUnsafeMutablePointer(to: &mutex, pthread_mutex_destroy)
 	}
 
 	func modify<Result>(didSet: (Value) -> Void = { _ in }, _ action: (inout Value) throws -> Result) rethrows -> Result {
-		lock.lock(); defer { didSet(_value); lock.unlock() }
+		let status = withUnsafeMutablePointer(to: &mutex, pthread_mutex_lock)
+		assert(status == 0, "Failed to acquire the property box recursive lock. Status code: \(status)")
+
+		defer {
+			didSet(_value)
+			_ = withUnsafeMutablePointer(to: &mutex, pthread_mutex_unlock)
+		}
+
 		return try action(&_value)
 	}
 }
