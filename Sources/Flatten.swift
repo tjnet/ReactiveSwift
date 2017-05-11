@@ -432,13 +432,13 @@ extension Signal where Value: SignalProducerProtocol, Error == Value.Error {
 			let relayDisposable = CompositeDisposable()
 
 			disposable += relayDisposable
-			disposable += self.observeConcurrent(relayObserver, limit, relayDisposable)
+			disposable += self.observeConcurrent(relayObserver, limit, DisposableCollector(relayDisposable))
 
 			return disposable
 		}
 	}
 
-	fileprivate func observeConcurrent(_ observer: ReactiveSwift.Observer<Value.Value, Error>, _ limit: UInt, _ disposable: CompositeDisposable) -> Disposable? {
+	fileprivate func observeConcurrent(_ observer: ReactiveSwift.Observer<Value.Value, Error>, _ limit: UInt, _ collector: DisposableCollector) -> Disposable? {
 		let state = Atomic(ConcurrentFlattenState<Value.Value, Error>(limit: limit))
 
 		func startNextIfNeeded() {
@@ -447,7 +447,7 @@ extension Signal where Value: SignalProducerProtocol, Error == Value.Error {
 				let deinitializer = ScopedDisposable(ActionDisposable(action: producerState.deinitialize))
 
 				producer.startWithSignal { signal, inner in
-					let handle = disposable.add(inner)
+					let handle = collector.add(inner)
 
 					signal.observe { event in
 						switch event {

@@ -19,7 +19,7 @@ import Result
 public struct SignalProducer<Value, Error: Swift.Error> {
 	public typealias ProducedSignal = Signal<Value, Error>
 
-	private let startHandler: (Signal<Value, Error>.Observer, CompositeDisposable) -> Void
+	private let startHandler: (Signal<Value, Error>.Observer, DisposableCollector) -> Void
 
 	/// Initializes a `SignalProducer` that will emit the same events as the
 	/// given signal.
@@ -48,7 +48,7 @@ public struct SignalProducer<Value, Error: Swift.Error> {
 	///
 	/// - parameters:
 	///   - startHandler: A closure that accepts observer and a disposable.
-	public init(_ startHandler: @escaping (Signal<Value, Error>.Observer, CompositeDisposable) -> Void) {
+	public init(_ startHandler: @escaping (Signal<Value, Error>.Observer, DisposableCollector) -> Void) {
 		self.startHandler = startHandler
 	}
 
@@ -118,7 +118,10 @@ public struct SignalProducer<Value, Error: Swift.Error> {
 	///   - values: A sequence of values that a `Signal` will send as separate
 	///             `value` events and then complete.
 	public init<S: Sequence>(_ values: S) where S.Iterator.Element == Value {
-		self.init { observer, disposable in
+		self.init { observer, collector in
+			let disposable = SimpleDisposable()
+			collector += disposable
+
 			for value in values {
 				observer.send(value: value)
 
@@ -181,7 +184,7 @@ public struct SignalProducer<Value, Error: Swift.Error> {
 			return
 		}
 
-		startHandler(observer, producerDisposable)
+		startHandler(observer, DisposableCollector(producerDisposable))
 	}
 }
 

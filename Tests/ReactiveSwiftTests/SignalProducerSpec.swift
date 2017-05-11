@@ -31,40 +31,6 @@ class SignalProducerSpec: QuickSpec {
 				expect(handlerCalledTimes) == 2
 			}
 
-			it("should not release signal observers when given disposable is disposed") {
-				var disposable: Disposable!
-
-				let producer = SignalProducer<Int, NoError> { observer, innerDisposable in
-					disposable = innerDisposable
-
-					innerDisposable += {
-						// This is necessary to keep the observer long enough to
-						// even test the memory management.
-						observer.send(value: 0)
-					}
-				}
-
-				weak var objectRetainedByObserver: NSObject?
-				producer.startWithSignal { signal, _ in
-					let object = NSObject()
-					objectRetainedByObserver = object
-					signal.observeValues { _ in _ = object }
-				}
-
-				expect(objectRetainedByObserver).toNot(beNil())
-
-				disposable.dispose()
-
-				// https://github.com/ReactiveCocoa/ReactiveCocoa/pull/2959
-				//
-				// Before #2959, this would be `nil` as the input observer is not
-				// retained, and observers would not retain the signal.
-				//
-				// After #2959, the object is still retained, since the observation
-				// keeps the signal alive.
-				expect(objectRetainedByObserver).toNot(beNil())
-			}
-
 			it("should dispose of added disposables upon completion") {
 				let addedDisposable = SimpleDisposable()
 				var observer: Signal<(), NoError>.Observer!
@@ -2195,9 +2161,10 @@ class SignalProducerSpec: QuickSpec {
 
 		describe("observeOn") {
 			it("should immediately cancel upstream producer's work when disposed") {
-				var upstreamDisposable: Disposable!
-				let producer = SignalProducer<(), NoError>{ _, innerDisposable in
-					upstreamDisposable = innerDisposable
+				let upstreamDisposable = SimpleDisposable()
+
+				let producer = SignalProducer<(), NoError>{ _, collector in
+					collector += upstreamDisposable
 				}
 
 				var downstreamDisposable: Disposable!
